@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python
 
 # Copyright 2017 Google Inc. All Rights Reserved.
@@ -23,70 +24,89 @@ Example usage:
 """
 
 import argparse
+import csv
+import datetime
 import io
+import os
 
+from google.cloud import speech_v1p1beta1 as speech
+from google.cloud import storage
+
+def _safe_filename(filename):
+        """
+        Generates a safe filename that is unlikely to collide with existing objects
+        in Google Cloud Storage.
+        ``filename.ext`` is transformed into ``filename-YYYY-MM-DD-HHMMSS.ext``
+        """
+        date = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H%M%S")
+        basename, extension = filename.rsplit('.', 1)
+        return "{0}-{1}.{2}".format(basename, date, extension)
 
 # [START def_transcribe_file]
-def transcribe_file(speech_file):
+def transcribe_file(filename, output):
     """Transcribe the given audio file asynchronously."""
-    from google.cloud import speech
-    from google.cloud.speech import enums
-    from google.cloud.speech import types
-    client = speech.SpeechClient()
+    client = storage.Client()
 
-    # [START migration_async_request]
-    with io.open(speech_file, 'rb') as audio_file:
-        content = audio_file.read()
+    bucket_name = 'bjoeris-temp-audio'
+    bucket = client.bucket(bucket_name)
+    blob_name = _safe_filename(filename)
+    blob = bucket.blob(blob_name)
+    print("Uploading file...")
+    with io.open(filename, 'rb') as audio_file:
+        blob.upload_from_file(audio_file)
+    uri = "gs://{}/{}".format(bucket_name, blob_name)
 
-    audio = types.RecognitionAudio(content=content)
-    config = types.RecognitionConfig(
-        encoding=enums.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code='en-US')
-
-    # [START migration_async_response]
-    operation = client.long_running_recognize(config, audio)
-    # [END migration_async_request]
-
-    print('Waiting for operation to complete...')
-    response = operation.result(timeout=90)
-
-    # Each result is for a consecutive portion of the audio. Iterate through
-    # them to get the transcripts for the entire audio file.
-    for result in response.results:
-        # The first alternative is the most likely one for this portion.
-        print(u'Transcript: {}'.format(result.alternatives[0].transcript))
-        print('Confidence: {}'.format(result.alternatives[0].confidence))
-    # [END migration_async_response]
+    transcribe_gcs(uri, output)
+    print("Deleting file...")
+    blob.delete()
 # [END def_transcribe_file]
 
 
 # [START def_transcribe_gcs]
-def transcribe_gcs(gcs_uri):
+def transcribe_gcs(gcs_uri, output):
     """Asynchronously transcribes the audio file specified by the gcs_uri."""
-    from google.cloud import speech
-    from google.cloud.speech import enums
-    from google.cloud.speech import types
     client = speech.SpeechClient()
 
-    audio = types.RecognitionAudio(uri=gcs_uri)
-    config = types.RecognitionConfig(
-        encoding=enums.RecognitionConfig.AudioEncoding.FLAC,
+    audio = speech.types.RecognitionAudio(uri=gcs_uri)
+
+    metadata = speech.types.RecognitionMetadata()
+    metadata.interaction_type = speech.enums.RecognitionMetadata.InteractionType.DISCUSSION
+    metadata.microphone_distance = speech.enums.RecognitionMetadata.MicrophoneDistance.NEARFIELD
+    metadata.recording_device_type = speech.enums.RecognitionMetadata.RecordingDeviceType.PC
+    config = speech.types.RecognitionConfig(
+        encoding=speech.enums.RecognitionConfig.AudioEncoding.FLAC,
         sample_rate_hertz=16000,
-        language_code='en-US')
+        language_code='en-US',
+        metadata=metadata,
+        enable_automatic_punctuation=True,
+        enable_word_time_offsets=True)
 
     operation = client.long_running_recognize(config, audio)
 
-    print('Waiting for operation to complete...')
+    print('Transcribing...')
     response = operation.result(timeout=90)
 
     # Each result is for a consecutive portion of the audio. Iterate through
     # them to get the transcripts for the entire audio file.
-    for result in response.results:
-        # The first alternative is the most likely one for this portion.
-        print(u'Transcript: {}'.format(result.alternatives[0].transcript))
-        print('Confidence: {}'.format(result.alternatives[0].confidence))
-# [END def_transcribe_gcs]
+    timestamp = 0.0
+    with open(output, 'w', newline='') as csvfile:
+        fieldnames = ['timestamp', 'confidence', 'transcript']
+        csvwriter = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        csvwriter.writeheader()
+        for result in response.results:
+            alternative = result.alternatives[0]
+            if len(alternative.words) > 0:
+                timestamp = alternative.words[0].start_time
+                timestamp = timestamp.seconds + 1e-9*timestamp.nanos
+                timestamp_mins = int(timestamp // 60)
+                timestamp_secs = timestamp - timestamp_mins * 60
+                csvwriter.writerow({
+                    'timestamp': '{}:{}'.format(timestamp_mins, timestamp_secs),
+                    'confidence': alternative.confidence,
+                    'transcript': alternative.transcript,
+                })
+                print(u'{}:{} | {} | {}'.format(timestamp_mins, timestamp_secs , alternative.confidence, alternative.transcript))
+# [END def_transcribe]
 
 
 if __name__ == '__main__':
@@ -94,9 +114,13 @@ if __name__ == '__main__':
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        'path', help='File or GCS path for audio file to be recognized')
+        'audio_file', help='File or GCS path for audio file to be transcribed')
+    parser.add_argument(
+        '--out', help='File to save the results (CSV)')
     args = parser.parse_args()
-    if args.path.startswith('gs://'):
-        transcribe_gcs(args.path)
+    if args.out is None:
+        args.out = os.path.splitext(args.audio_file)[0] + ".csv"
+    if args.audio_file.startswith('gs://'):
+        transcribe_gcs(args.audio_file, args.out)
     else:
-        transcribe_file(args.path)
+        transcribe_file(args.audio_file, args.out)
