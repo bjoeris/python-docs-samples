@@ -28,9 +28,13 @@ import csv
 import datetime
 import io
 import os
+import subprocess
 
 from google.cloud import speech_v1p1beta1 as speech
+# from google.cloud import speech
 from google.cloud import storage
+
+UPLOAD_BUCKET_NAME = 'bjoeris-temp-audio'
 
 def _safe_filename(filename):
         """
@@ -39,7 +43,7 @@ def _safe_filename(filename):
         ``filename.ext`` is transformed into ``filename-YYYY-MM-DD-HHMMSS.ext``
         """
         date = datetime.datetime.utcnow().strftime("%Y-%m-%d-%H%M%S")
-        basename, extension = filename.rsplit('.', 1)
+        basename, extension = os.path.splitext(os.path.basename(filename))
         return "{0}-{1}.{2}".format(basename, date, extension)
 
 # [START def_transcribe_file]
@@ -47,22 +51,34 @@ def transcribe_file(filename, output):
     """Transcribe the given audio file asynchronously."""
     client = storage.Client()
 
-    bucket_name = 'bjoeris-temp-audio'
+    print("Converting file...")
+    filename = transcode_file(filename)
+
+    bucket_name = UPLOAD_BUCKET_NAME
     bucket = client.bucket(bucket_name)
     blob_name = _safe_filename(filename)
     blob = bucket.blob(blob_name)
-    print("Uploading file...")
+    uri = "gs://{}/{}".format(bucket_name, blob_name)
+    print("Uploading file...", uri)
     with io.open(filename, 'rb') as audio_file:
         blob.upload_from_file(audio_file)
-    uri = "gs://{}/{}".format(bucket_name, blob_name)
 
-    transcribe_gcs(uri, output)
-    print("Deleting file...")
-    blob.delete()
+    operation = transcribe_gcs(uri, output)
+    def callback(operation_future):
+        print("Deleting file...")
+        blob.delete()
+    operation.add_done_callback(callback)
+    return operation
 # [END def_transcribe_file]
 
+def transcode_file(filename):
+    stripped_name, ext = os.path.splitext(filename)
+    output = '{}-transcode.flac'.format(stripped_name)
+    subprocess.run(['ffmpeg', '-i', filename, '-ac', '1', '-ar', '48000', '-acodec', 'flac', output])
+    print("transcoded: ", output)
+    return output
 
-# [START def_transcribe_gcs]
+
 def transcribe_gcs(gcs_uri, output):
     """Asynchronously transcribes the audio file specified by the gcs_uri."""
     client = speech.SpeechClient()
@@ -73,40 +89,45 @@ def transcribe_gcs(gcs_uri, output):
     metadata.interaction_type = speech.enums.RecognitionMetadata.InteractionType.DISCUSSION
     metadata.microphone_distance = speech.enums.RecognitionMetadata.MicrophoneDistance.NEARFIELD
     metadata.recording_device_type = speech.enums.RecognitionMetadata.RecordingDeviceType.PC
+
     config = speech.types.RecognitionConfig(
         encoding=speech.enums.RecognitionConfig.AudioEncoding.FLAC,
-        sample_rate_hertz=16000,
+        sample_rate_hertz=48000,
         language_code='en-US',
         metadata=metadata,
         enable_automatic_punctuation=True,
-        enable_word_time_offsets=True)
+        enable_word_time_offsets=True,
+    )
 
+    print('Transcribing... {}'.format(gcs_uri))
     operation = client.long_running_recognize(config, audio)
+    operation.add_done_callback(lambda operation_future: save_results(operation_future.result().results, output))
+    return operation
 
-    print('Transcribing...')
-    response = operation.result(timeout=90)
-
+def save_results(results, output):
     # Each result is for a consecutive portion of the audio. Iterate through
     # them to get the transcripts for the entire audio file.
-    timestamp = 0.0
     with open(output, 'w', newline='') as csvfile:
         fieldnames = ['timestamp', 'confidence', 'transcript']
         csvwriter = csv.DictWriter(csvfile, fieldnames=fieldnames)
         csvwriter.writeheader()
-        for result in response.results:
+        for result in results:
             alternative = result.alternatives[0]
             if len(alternative.words) > 0:
                 timestamp = alternative.words[0].start_time
                 timestamp = timestamp.seconds + 1e-9*timestamp.nanos
-                timestamp_mins = int(timestamp // 60)
-                timestamp_secs = timestamp - timestamp_mins * 60
-                csvwriter.writerow({
-                    'timestamp': '{}:{}'.format(timestamp_mins, timestamp_secs),
-                    'confidence': alternative.confidence,
-                    'transcript': alternative.transcript,
-                })
-                print(u'{}:{} | {} | {}'.format(timestamp_mins, timestamp_secs , alternative.confidence, alternative.transcript))
-# [END def_transcribe]
+                timestamp_hrs = int(timestamp // 3600)
+                timestamp_mins = int((timestamp - timestamp_hrs*3600) // 60)
+                timestamp_secs = int(timestamp - timestamp_mins * 60 - timestamp_hrs * 3600)
+                timestamp_str = '{:0>2d}:{:0>2d}:{:0>2d}'.format(timestamp_hrs, timestamp_mins, timestamp_secs)
+            else:
+                timestamp_str = ''
+            csvwriter.writerow({
+                'timestamp': timestamp_str,
+                'confidence': '{:.2f}'.format(alternative.confidence),
+                'transcript': alternative.transcript,
+            })
+            print(u'{} | {:.2f} | {}'.format(timestamp_str, alternative.confidence, alternative.transcript))
 
 
 if __name__ == '__main__':
@@ -120,7 +141,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.out is None:
         args.out = os.path.splitext(args.audio_file)[0] + ".csv"
+    operation = None
     if args.audio_file.startswith('gs://'):
-        transcribe_gcs(args.audio_file, args.out)
+        operation = transcribe_gcs(args.audio_file, args.out)
     else:
-        transcribe_file(args.audio_file, args.out)
+        operation = transcribe_file(args.audio_file, args.out)
+    operation.result()
